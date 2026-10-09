@@ -54,7 +54,7 @@ const CONFIG = {
   EVOLVE_FX_TIME: 1.6,            // 빛줄기/섬광 연출 시간
 
   // 코인
-  COIN_DROP_COOLDOWN: 2.5,        // 코인 최소 드랍 간격 (초) — 연속 드랍 방지
+  COIN_DROP_COOLDOWN: 1.5,        // 코인 최소 드랍 간격 (초) — 연속 드랍 방지
   COIN_SPEED: 26,
   COIN_MAGNET_RANGE: 28,
   COIN_PICKUP_RANGE: 10,
@@ -66,7 +66,8 @@ const CONFIG = {
   SPAWN_INTERVAL_MIN: 0.32,
   GROUP_CHANCE_PER_WAVE: 0.06,    // 웨이브당 편대(3기) 등장 확률 증가
   ENEMY_SPEED_UP: 0.06,           // 웨이브당 적 이동속도 +6%
-  ENEMY_HP_GROWTH: 0.18,          // 웨이브당 적 체력 +18%
+  ENEMY_HP_STEP_WAVES: 3,         // 이 웨이브 수마다 적 체력이 한 단계 오름 (1~3: 1단계, 4~6: 2단계 …)
+  ENEMY_HP_STEP: 0.3,             // 단계당 적 체력 +30%
   ENEMY_BULLET_SPEED: 60,
   ENEMY_BULLET_SPEED_UP: 4,       // 웨이브당 적 탄속 증가
   ENEMY_BULLET_SPEED_MAX: 125,
@@ -124,11 +125,11 @@ const CONFIG = {
 
 // 적 종류별 기본 능력치 (drop = 코인 드랍 확률)
 const ENEMY_TYPES = {
-  imp:     { hp: 3,  speed: 44, drop: 0.07 },                     // 직선 하강
-  bat:     { hp: 3,  speed: 36, drop: 0.07, amp: 30, freq: 2.6 }, // 지그재그
-  mage:    { hp: 6,  speed: 40, drop: 0.09 },                     // 멈춰서 불덩이
-  charger: { hp: 5,  speed: 34, drop: 0.08 },                     // 조준 후 돌진
-  elite:   { hp: 30, speed: 26, drop: 0.3 },                      // 대형, 가시 부채꼴
+  imp:     { hp: 2,  speed: 44, drop: 0.15 },                     // 직선 하강
+  bat:     { hp: 2,  speed: 36, drop: 0.15, amp: 30, freq: 2.6 }, // 지그재그
+  mage:    { hp: 4,  speed: 40, drop: 0.18 },                     // 멈춰서 불덩이
+  charger: { hp: 3,  speed: 34, drop: 0.16 },                     // 조준 후 돌진
+  elite:   { hp: 18, speed: 26, drop: 0.4 },                      // 대형, 가시 부채꼴
 };
 
 // 스킬 정보: 코인/HUD 색, 5x5 아이콘(비트), 강화 문구
@@ -961,7 +962,8 @@ const preview = { beams: [], fireT: 0 };   // 드래곤 선택 미리보기 브�
 const arrowPress = { l: -1, r: -1 };
 
 const speedMul = () => 1 + CONFIG.ENEMY_SPEED_UP * (game.wave - 1);
-const hpMul = () => 1 + CONFIG.ENEMY_HP_GROWTH * (game.wave - 1);
+// 적 체력은 웨이브마다 조금씩이 아니라 ENEMY_HP_STEP_WAVES마다 한 단계씩 오름
+const hpMul = () => 1 + CONFIG.ENEMY_HP_STEP * Math.floor((game.wave - 1) / CONFIG.ENEMY_HP_STEP_WAVES);
 const enemyBulletSpeed = () =>
   Math.min(CONFIG.ENEMY_BULLET_SPEED_MAX, CONFIG.ENEMY_BULLET_SPEED + CONFIG.ENEMY_BULLET_SPEED_UP * (game.wave - 1));
 const fireInterval = () => CONFIG.FIRE_INTERVAL - CONFIG.FIRE_INTERVAL_STEP * player.skills.rate;
