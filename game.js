@@ -126,6 +126,12 @@ const CONFIG = {
   ULT_RADIUS_MIN: 40,              // 가득이면 화면 전체
   ULT_TIME: 0.5,                   // 충격파가 퍼지는 시간 (초)
 
+  // 듀얼 모드 (PC 2인 협동). 솔로 모드에는 적용 안 됨
+  DUAL_W: 320,                     // 가로 내부 해상도 (솔로 180)
+  DUAL_ENEMY_HP: 1.5,              // 잡몹/정예 체력 배율
+  DUAL_BOSS_HP: 2.2,               // 보스 체력 배율
+  DUAL_REVIVE_HP: 2,               // 쓰러진 쪽은 보스를 잡으면 이 체력으로 부활
+
   // 점수
   SCORE: { imp: 100, bat: 150, charger: 200, mage: 250, elite: 1200, boss: 5000, coin: 50, cappedCoin: 300 },
 };
@@ -203,8 +209,9 @@ const SCENES = [
     spawns: [{ k: 'lava', every: 3.2 }, { k: 'bones', every: 1.6 }, { k: 'spikes', every: 1.8 }, { k: 'ember', every: 0.08 }] },
 ];
 
-const W = CONFIG.W;
+let W = CONFIG.W;                 // 듀얼 모드에선 CONFIG.DUAL_W로 바뀜 (setWidth)
 const BEST_KEY = 'pixelStriker.best';
+const BEST_DUAL_KEY = 'pixelStriker.bestDual';
 const MUTE_KEY = 'pixelStriker.muted';
 const SKIN_KEY = 'pixelStriker.dragon';
 
@@ -938,49 +945,82 @@ const game = {
   state: 'title',          // title | play | over
   time: 0, wave: 1, score: 0,
   best: parseInt(storeGet(BEST_KEY), 10) || 0,
+  bestDual: parseInt(storeGet(BEST_DUAL_KEY), 10) || 0,
+  dual: false,
   spawnT: 0, bossCount: 0, warningT: 0, boss: null, nextBoss: null, warnPlayed: false,
   shake: 0, shakeMag: 0, banner: '', sub: '', bannerT: 0, overT: 0, newRecord: false, clock: 0,
   skillText: '', skillColor: '#fff', skillT: 0, evolveT: 0, lastCoin: -99,
   purgeBullets: false,
-  nova: null, novaSeq: 0, novaKill: false,   // 필살기 충격파
+  novas: [], novaSeq: 0, novaKill: false,    // 필살기 충격파 (듀얼은 둘이 동시에 쏠 수 있음)
   // 배경 단계 보간 상태
   timeScale: 1, slowmo: 0, evolveFx: null,   // 진화 슬로모션 / 연출
   sceneIdx: 0, sceneT: 1, sceneFrom: null, decoTimers: [], flash: null, lightning: null, lightningT: 0,
 };
 
 let skinIdx = clamp(SKINS.findIndex((s) => s.id === storeGet(SKIN_KEY)), 0, SKINS.length - 1);
-const skin = () => SKINS[skinIdx];
+// 2P는 skinI로 자기 드래곤을 가짐 (1P/솔로는 선택한 skinIdx)
+const skin = () => SKINS[player.skinI !== undefined ? player.skinI : skinIdx];
 
-const player = {
+const newPlayer = () => ({
   x: W / 2, y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0, alive: true, muzzle: 0, powerT: 0, tier: 0,
   skills: { rate: 0, spread: 0, damage: 0, pierce: 0 },
   coinProg: { rate: 0, spread: 0, damage: 0, pierce: 0, orb: 0 },   // 다음 강화까지 모은 코인
   orb: 0, orbAngle: 0,            // 수호 구체 레벨 / 회전 각도
+  orbPos: [],                     // 이 플레이어의 구체 좌표
   ult: 0,                         // 필살기 게이지 (0~1)
-};
+});
+// 플레이어별 로직은 전역 player를 해당 플레이어로 잠깐 바꿔 끼워 그대로 재사용 (솔로는 항상 p1)
+const p1 = newPlayer(), p2 = newPlayer();
+let player = p1;
+const players = [p1];
+function withPlayer(p, fn) {
+  const prev = player;
+  player = p;
+  const r = fn();
+  player = prev;
+  return r;
+}
+// 적이 노릴 대상: 가장 가까운 살아 있는 플레이어
+function target(x, y) {
+  let best = p1, bd = Infinity;
+  for (const p of players) {
+    if (!p.alive) continue;
+    const d = (p.x - x) ** 2 + (p.y - y) ** 2;
+    if (d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
 
 // 별(먼지) 패럴랙스 3겹. 색은 배경 단계에서 보간
 const STAR_LAYERS = [
   { n: 30, speed: 10 }, { n: 18, speed: 24 }, { n: 8, speed: 50 },
 ].map((l) => ({ ...l, stars: Array.from({ length: l.n }, () => ({ x: rand(0, W) | 0, y: rand(0, H) })) }));
 
-// 시작/게임오버 화면 버튼 영역 (내부 좌표)
-const UI = {
-  left: { x: 6, y: 93 + OY, w: 28, h: 40 },
-  right: { x: W - 34, y: 93 + OY, w: 28, h: 40 },
-  thumbs: SKINS.map((s, i) => ({ x: 7 + i * 34, y: 180 + OY, w: 30, h: 28 })),
-  start: { x: W / 2 - 46, y: 216 + OY, w: 92, h: 24 },
-  retry: { x: W / 2 - 62, y: 216 + OY, w: 58, h: 22 },
-  menu: { x: W / 2 + 4, y: 216 + OY, w: 58, h: 22 },
-  resume: { x: W / 2 - 46, y: 150 + OY, w: 92, h: 24 },
-  quit: { x: W / 2 - 46, y: 182 + OY, w: 92, h: 22 },
-};
+// 듀얼 모드는 키보드 2인용이라 마우스/키보드 환경(PC)에서만 노출
+const CAN_DUAL = window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+// 시작/게임오버 화면 버튼 영역 (내부 좌표). 화면 폭이 바뀌면 layoutUI로 다시 계산
+const UI = {};
+function layoutUI() {
+  Object.assign(UI, {
+    left: { x: 6, y: 93 + OY, w: 28, h: 40 },
+    right: { x: W - 34, y: 93 + OY, w: 28, h: 40 },
+    thumbs: SKINS.map((s, i) => ({ x: 7 + i * 34, y: 180 + OY, w: 30, h: 28 })),
+    start: CAN_DUAL ? { x: W / 2 - 62, y: 216 + OY, w: 58, h: 24 } : { x: W / 2 - 46, y: 216 + OY, w: 92, h: 24 },
+    dual: { x: W / 2 + 4, y: 216 + OY, w: 58, h: 24 },
+    retry: { x: W / 2 - 62, y: 216 + OY, w: 58, h: 22 },
+    menu: { x: W / 2 + 4, y: 216 + OY, w: 58, h: 22 },
+    resume: { x: W / 2 - 46, y: 150 + OY, w: 92, h: 24 },
+    quit: { x: W / 2 - 46, y: 182 + OY, w: 92, h: 22 },
+  });
+}
+layoutUI();
 const preview = { beams: [], fireT: 0 };   // 드래곤 선택 미리보기 브레스
 const arrowPress = { l: -1, r: -1 };
 
 const speedMul = () => 1 + CONFIG.ENEMY_SPEED_UP * (game.wave - 1);
 // 적 체력은 웨이브마다 조금씩이 아니라 ENEMY_HP_STEP_WAVES마다 한 단계씩 오름
-const hpMul = () => 1 + CONFIG.ENEMY_HP_STEP * Math.floor((game.wave - 1) / CONFIG.ENEMY_HP_STEP_WAVES);
+const hpMul = () => (1 + CONFIG.ENEMY_HP_STEP * Math.floor((game.wave - 1) / CONFIG.ENEMY_HP_STEP_WAVES)) * (game.dual ? CONFIG.DUAL_ENEMY_HP : 1);
 const enemyBulletSpeed = () =>
   Math.min(CONFIG.ENEMY_BULLET_SPEED_MAX, CONFIG.ENEMY_BULLET_SPEED + CONFIG.ENEMY_BULLET_SPEED_UP * (game.wave - 1));
 const fireInterval = () => CONFIG.FIRE_INTERVAL - CONFIG.FIRE_INTERVAL_STEP * player.skills.rate;
@@ -993,14 +1033,17 @@ const sceneForWave = (w) => { let s = 0; CONFIG.SCENE_WAVES.forEach((sw, i) => {
 function resetGame() {
   Object.assign(game, {
     state: 'play', paused: false, time: 0, wave: 1, score: 0, spawnT: 1, bossCount: 0, warningT: 0, boss: null, nextBoss: null, warnPlayed: false,
-    shake: 0, overT: 0, newRecord: false, purgeBullets: false, skillT: 0, evolveT: 0, lastCoin: -99, lightning: null, nova: null,
+    shake: 0, overT: 0, newRecord: false, purgeBullets: false, skillT: 0, evolveT: 0, lastCoin: -99, lightning: null, novas: [],
   });
-  Object.assign(player, { x: W / 2, y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0.2, alive: true, muzzle: 0, powerT: 0, tier: 0, ult: 0 });
-  player.skills = { rate: 0, spread: 0, damage: 0, pierce: 0 };
-  player.coinProg = { rate: 0, spread: 0, damage: 0, pierce: 0, orb: 0 };
-  player.orb = 0; player.orbAngle = 0;
+  const startX = game.dual ? [W / 3, (W * 2) / 3] : [W / 2];
+  players.forEach((p, i) => {
+    Object.assign(p, { x: startX[i], y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0.2, alive: true, muzzle: 0, powerT: 0, tier: 0, ult: 0 });
+    p.skills = { rate: 0, spread: 0, damage: 0, pierce: 0 };
+    p.coinProg = { rate: 0, spread: 0, damage: 0, pierce: 0, orb: 0 };
+    p.orb = 0; p.orbAngle = 0; p.orbPos.length = 0;
+  });
   game.timeScale = 1; game.slowmo = 0; game.evolveFx = null;
-  input.tx = player.x; input.ty = player.y;
+  input.tx = p1.x; input.ty = p1.y;
   [bullets, enemyBullets, enemies, coins, particles, rings, texts].forEach((p) => p.clear());
   lasers.length = 0;
   setScene(0);
@@ -1042,6 +1085,7 @@ function demonBurst(e, scale = 1) {
 function ring(x, y, color, maxR, life, follow = false, delay = 0) {
   const r = rings.spawn();
   r.x = x; r.y = y; r.color = color; r.maxR = maxR; r.life = r.max = life; r.follow = follow; r.delay = delay;
+  r.owner = player;   // follow 링이 따라갈 플레이어
 }
 
 // --- 배경 단계 ---
@@ -1125,20 +1169,21 @@ function updateBackground(dt) {
 function updatePlayer(dt) {
   const p = player;
   if (!p.alive) return;
+  const pk = p === p2 ? keys2 : keys;   // 듀얼: 1P = WASD(keys), 2P = 방향키(keys2)
   let kx = 0, ky = 0;
-  if (keys.left) kx--; if (keys.right) kx++;
-  if (keys.up) ky--; if (keys.down) ky++;
+  if (pk.left) kx--; if (pk.right) kx++;
+  if (pk.up) ky--; if (pk.down) ky++;
   if (kx || ky) {
     const len = Math.hypot(kx, ky);
     p.x += (kx / len) * CONFIG.PLAYER_KEY_SPEED * dt;
     p.y += (ky / len) * CONFIG.PLAYER_KEY_SPEED * dt;
-  } else if (input.active) {
+  } else if (input.active && p === p1) {
     const k = Math.min(1, CONFIG.PLAYER_FOLLOW * dt);
     p.x += (input.tx - p.x) * k;
     p.y += (input.ty - p.y) * k;
   }
   p.x = clamp(p.x, 8, W - 8);
-  p.y = clamp(p.y, 34, H - 10);
+  p.y = clamp(p.y, 34, H - (game.dual ? 16 : 10));   // 듀얼은 하단 HUD가 더 높음
   if (p.invuln > 0) p.invuln -= dt;
   if (p.muzzle > 0) p.muzzle -= dt;
   if (p.powerT > 0) p.powerT -= dt;
@@ -1200,35 +1245,43 @@ function hitPlayer() {
   if (player.hp <= 0) gameOver();
 }
 
+// 현재 player 쓰러짐. 듀얼에서 한 명이라도 살아 있으면 게임은 계속
 function gameOver() {
-  game.state = 'over';
-  game.overT = 0;
   player.alive = false;
-  input.active = false;
-  lasers.length = 0;
+  player.orbPos.length = 0;
   explode(player.x, player.y, ['#ffffff', ...skin().breath, skin().pal.B], 50, 70, 3);
   ring(player.x, player.y, '#ffffff', 34, 0.6);
   shake(0.6, 3);
   Sound.explode(true);
-  if (game.score > game.best) {
-    game.best = game.score;
+  if (players.some((p) => p.alive)) { popText(player.x, player.y - 16, 'DOWN!', '#ff4a5a'); return; }
+  game.state = 'over';
+  game.overT = 0;
+  input.active = false;
+  lasers.length = 0;
+  const best = game.dual ? 'bestDual' : 'best';
+  if (game.score > game[best]) {
+    game[best] = game.score;
     game.newRecord = true;
-    storeSet(BEST_KEY, String(game.best));
+    storeSet(game.dual ? BEST_DUAL_KEY : BEST_KEY, String(game[best]));
   }
 }
 
 // --- 수호 구체 ---
-const orbPositions = [];   // 매 프레임 갱신되는 구체 좌표 (재사용 배열)
+const orbPositions = [];   // 매 프레임 갱신되는 전체 구체 좌표 (충돌 판정용, 재사용 배열)
 function updateOrbs(dt) {
-  const n = CONFIG.ORB_COUNT_BY_LV[player.orb];
+  const n = CONFIG.ORB_COUNT_BY_LV[player.orb], pos = player.orbPos;
   player.orbAngle += CONFIG.ORB_SPEED_BY_LV[player.orb] * dt;
-  orbPositions.length = 0;
+  pos.length = 0;
   if (!player.alive || !n) return;
   const r = CONFIG.ORB_RADIUS + (player.orb >= 4 ? 2 : 0);
   for (let i = 0; i < n; i++) {
     const a = player.orbAngle + (i / n) * Math.PI * 2;
-    orbPositions.push(player.x + Math.cos(a) * r, player.y + Math.sin(a) * r * 0.9);
+    pos.push(player.x + Math.cos(a) * r, player.y + Math.sin(a) * r * 0.9);
   }
+}
+function gatherOrbs() {
+  orbPositions.length = 0;
+  for (const p of players) for (const v of p.orbPos) orbPositions.push(v);
 }
 const orbHit = (x, y, rad) => {
   for (let i = 0; i < orbPositions.length; i += 2) {
@@ -1274,7 +1327,8 @@ function checkEvolve() {
   // 진화 연출: 슬로모션 + 화면 섬광 + 회전 빛줄기 + 큰 충격파 4겹 + 파티클 폭발 + 주변 탄 제거
   const sk = skin();
   game.slowmo = CONFIG.EVOLVE_SLOWMO; game.slowmoScale = CONFIG.EVOLVE_SLOWMO_SCALE;
-  game.evolveFx = { t: 0, dur: CONFIG.EVOLVE_FX_TIME, color: sk.breath[1], deco: sk.deco };
+  game.evolveFx = { t: 0, dur: CONFIG.EVOLVE_FX_TIME, color: sk.breath[1], deco: sk.deco, owner: player };
+  game.evolveWho = player;
   game.purgeBullets = true;
   ring(player.x, player.y, '#ffffff', 70, 0.8, true);
   ring(player.x, player.y, sk.deco, 55, 0.8, true, 0.12);
@@ -1344,7 +1398,7 @@ function spawnBoss(defIdx) {
   const def = defIdx !== undefined ? BOSS_DEFS[defIdx] : (game.nextBoss || BOSS_DEFS[game.bossCount % BOSS_DEFS.length]);
   const spr = def.spr, e = enemies.spawn();
   const stage = game.bossCount;
-  const hp = CONFIG.BOSS_HP * (1 + CONFIG.BOSS_HP_GROWTH * stage);
+  const hp = CONFIG.BOSS_HP * (1 + CONFIG.BOSS_HP_GROWTH * stage) * (game.dual ? CONFIG.DUAL_BOSS_HP : 1);
   Object.assign(e, {
     type: 'boss', boss: true, def, spr, w: spr.w, h: spr.h, x: W / 2, y: -spr.h, baseY: 64,
     hp, maxHp: hp, t: 0, flash: -1, orbCd: 0, dead: false, state: 'enter', stage, phase: 0,
@@ -1378,7 +1432,7 @@ function spawnEnemyBullet(x, y, vx, vy, kind) {
 }
 // 플레이어 방향으로 n발 (spread 간격 부채꼴)
 function fireAimed(x, y, n, spread, speed, kind) {
-  const a0 = Math.atan2(player.y - y, player.x - x);
+  const t = target(x, y), a0 = Math.atan2(t.y - y, t.x - x);
   for (let i = 0; i < n; i++) {
     const a = a0 + (i - (n - 1) / 2) * spread;
     spawnEnemyBullet(x, y, Math.cos(a) * speed, Math.sin(a) * speed, kind);
@@ -1423,7 +1477,7 @@ function updateCharger(e, dt) {
     e.life -= dt;
     if (e.life <= 0) {
       e.state = 'charge';
-      const dx = player.x - e.x, dy = Math.max(40, player.y - e.y);
+      const t = target(e.x, e.y), dx = t.x - e.x, dy = Math.max(40, t.y - e.y);
       const sp = CONFIG.CHARGER_SPEED * speedMul();
       e.vx = clamp(dx / dy, -0.35, 0.35) * sp; e.vy = sp;
     }
@@ -1465,10 +1519,11 @@ function updateEnemies(dt) {
     }
     // 몸체 충돌 (판정은 외형보다 작게, 잡몹은 함께 폭발)
     const bsh = e.boss ? 8 : sh;
-    if (game.state === 'play' && player.invuln <= 0 &&
-        overlap(e.x, e.y, e.w / 2 - bsh, e.h / 2 - bsh, player.x, player.y, hb.hw, hb.hh)) {
-      hitPlayer();
-      if (!e.boss) killEnemy(e, false);
+    for (const p of players) {
+      if (game.state !== 'play' || !p.alive || p.invuln > 0 ||
+          !overlap(e.x, e.y, e.w / 2 - bsh, e.h / 2 - bsh, p.x, p.y, hb.hw, hb.hh)) continue;
+      withPlayer(p, hitPlayer);
+      if (!e.boss) { killEnemy(e, false); break; }
     }
     return !e.dead && (e.boss || (e.y < H + e.h && e.x > -40 && e.x < W + 40));
   });
@@ -1490,10 +1545,17 @@ function killEnemy(e, drop) {
   e.dead = true;
   game.score += e.score;
   // 필살기 게이지 충전 (필살기로 잡은 적은 제외)
-  if (!game.novaKill && player.alive) {
-    const before = player.ult;
-    player.ult = Math.min(1, before + (CONFIG.ULT_GAIN[e.type] || 0));
-    if (before < CONFIG.ULT_MIN && player.ult >= CONFIG.ULT_MIN) popText(player.x, player.y - 20, 'R: NOVA READY', skin().breath[1]);
+  // 듀얼은 협동이라 살아 있는 두 명 모두 충전
+  if (!game.novaKill) {
+    for (const p of players) {
+      if (!p.alive) continue;
+      const before = p.ult;
+      p.ult = Math.min(1, before + (CONFIG.ULT_GAIN[e.type] || 0));
+      if (before < CONFIG.ULT_MIN && p.ult >= CONFIG.ULT_MIN) {
+        const label = p === p2 ? 'ENTER: NOVA READY' : 'R: NOVA READY';
+        withPlayer(p, () => popText(p.x, p.y - 20, label, skin().breath[1]));
+      }
+    }
   }
   if (e.boss) {
     onBossDefeated(e);
@@ -1526,8 +1588,20 @@ function onBossDefeated(e) {
   popText(e.x, e.y + 18, '+' + e.score, '#ffd23f');
   Sound.explode(true);
   // 보상: 상한 해제 + 확정 스킬 강화 1회 (진화 구간을 넘으면 EVOLVE 연출)
-  const options = SKILL_ORDER.filter((k) => player.skills[k] < CONFIG.SKILL_MAX[k]);
-  if (options.length && totalPower() < powerCap() && player.alive) levelUp(pick(options), true);
+  // 듀얼: 쓰러졌던 쪽은 부활
+  for (const p of players) {
+    withPlayer(p, () => {
+      if (!p.alive) { if (game.dual && game.state === 'play') revivePlayer(); return; }
+      const options = SKILL_ORDER.filter((k) => player.skills[k] < CONFIG.SKILL_MAX[k]);
+      if (options.length && totalPower() < powerCap()) levelUp(pick(options), true);
+    });
+  }
+}
+function revivePlayer() {
+  Object.assign(player, { alive: true, hp: CONFIG.DUAL_REVIVE_HP, invuln: 2, fireT: 0.3, y: H - 40 });
+  ring(player.x, player.y, '#ffffff', 30, 0.6, true);
+  explode(player.x, player.y, ['#ffffff', ...skin().breath], 24, 60);
+  popText(player.x, player.y - 20, 'REVIVE!', skin().breath[1]);
 }
 
 // --- 필살기: 드래곤 노바 ---
@@ -1538,7 +1612,7 @@ function fireUlt() {
   if (g < CONFIG.ULT_MIN) { Sound.locked(); return; }
   player.ult = 0;
   const sk = skin(), maxR = lerp(CONFIG.ULT_RADIUS_MIN, Math.hypot(W, H), g);
-  game.nova = { x: player.x, y: player.y, t: 0, maxR, dmg: CONFIG.ULT_DAMAGE * g, id: ++game.novaSeq };
+  game.novas.push({ x: player.x, y: player.y, t: 0, maxR, dmg: CONFIG.ULT_DAMAGE * g, id: ++game.novaSeq });
   ring(player.x, player.y, '#ffffff', maxR, CONFIG.ULT_TIME);
   ring(player.x, player.y, sk.breath[1], maxR * 0.85, CONFIG.ULT_TIME, false, 0.05);
   ring(player.x, player.y, sk.deco, maxR * 0.7, CONFIG.ULT_TIME, false, 0.1);
@@ -1549,8 +1623,13 @@ function fireUlt() {
   Sound.ult(g);
 }
 function updateNova(dt) {
-  const n = game.nova;
-  if (!n) return;
+  for (let i = game.novas.length - 1; i >= 0; i--) {
+    const n = game.novas[i];
+    updateOneNova(n, dt);
+    if (n.t >= CONFIG.ULT_TIME) game.novas.splice(i, 1);
+  }
+}
+function updateOneNova(n, dt) {
   n.t += dt;
   const r = n.maxR * Math.min(1, n.t / CONFIG.ULT_TIME);
   game.novaKill = true;
@@ -1567,7 +1646,6 @@ function updateNova(dt) {
     explode(b.x, b.y, ['#ffffff'], 1, 15, 1);
     return false;
   });
-  if (n.t >= CONFIG.ULT_TIME) game.nova = null;
 }
 
 // --- 보스 패턴 ---
@@ -1584,9 +1662,9 @@ function startPattern(b) {
   if (b.pat === 'laser') {
     // 경고선 → 발사 (경고 시간 동안 피할 수 있음)
     const n = Math.min(3, 1 + Math.floor(lv / 2)), warn = Math.max(0.7, CONFIG.LASER_WARN - 0.05 * lv);
-    const xs = [player.x];
-    if (n >= 2) xs.push(player.x + (player.x < W / 2 ? 46 : -46));
-    if (n >= 3) xs.push(player.x + (player.x < W / 2 ? -46 : 46));
+    const t = target(b.x, b.y), xs = [t.x];
+    if (n >= 2) xs.push(t.x + (t.x < W / 2 ? 46 : -46));
+    if (n >= 3) xs.push(t.x + (t.x < W / 2 ? -46 : 46));
     xs.forEach((x) => lasers.push({ x: clamp(x, 8, W - 8), y0: b.y + 10, warn, fire: CONFIG.LASER_TIME }));
     b.patDur = warn + CONFIG.LASER_TIME + 0.3;
     Sound.laser();
@@ -1599,7 +1677,7 @@ function startPattern(b) {
     }
     ring(b.x, b.y, '#ff3a8a', 30, 0.5);
   } else if (b.pat === 'dive') {
-    b.sub = { st: 'warn', t: 0.75, tx: clamp(player.x, b.w / 2, W - b.w / 2) };
+    b.sub = { st: 'warn', t: 0.75, tx: clamp(target(b.x, b.y).x, b.w / 2, W - b.w / 2) };
   }
 }
 function bossFire(b, lv) {
@@ -1612,7 +1690,7 @@ function bossFire(b, lv) {
     b.fireT = Math.max(0.6, 1.0 - 0.08 * lv);
   } else if (b.pat === 'ring') {
     // 원형 탄막: 플레이어 근처 방향에 3발짜리 빈틈을 항상 남김
-    const n = Math.min(CONFIG.BOSS_RING_MAX, CONFIG.BOSS_RING_BASE + Math.floor(2 * lv)), gap = Math.atan2(player.y - b.y, player.x - b.x) + rand(-0.5, 0.5);
+    const n = Math.min(CONFIG.BOSS_RING_MAX, CONFIG.BOSS_RING_BASE + Math.floor(2 * lv)), tp = target(b.x, b.y), gap = Math.atan2(tp.y - b.y, tp.x - b.x) + rand(-0.5, 0.5);
     for (let i = 0; i < n; i++) {
       const a = (i / n) * Math.PI * 2 + b.spin;
       const d = Math.abs(((a - gap) % (Math.PI * 2) + Math.PI * 3) % (Math.PI * 2) - Math.PI);
@@ -1703,7 +1781,9 @@ function updateLasers(dt) {
     const l = lasers[i];
     if (l.warn > 0) { l.warn -= dt; if (l.warn <= 0) shake(0.15, 1); continue; }
     l.fire -= dt;
-    if (game.state === 'play' && player.invuln <= 0 && Math.abs(player.x - l.x) < CONFIG.LASER_HALF_WIDTH + hb.hw - 1 && player.y > l.y0) hitPlayer();
+    for (const p of players) {
+      if (game.state === 'play' && p.alive && p.invuln <= 0 && Math.abs(p.x - l.x) < CONFIG.LASER_HALF_WIDTH + hb.hw - 1 && p.y > l.y0) withPlayer(p, hitPlayer);
+    }
     if (l.fire <= 0) lasers.splice(i, 1);
   }
 }
@@ -1741,9 +1821,11 @@ function updateEnemyBullets(dt) {
       explode(b.x, b.y, [SKILL_INFO.orb.color, '#ffffff'], 3, 30, 1);
       return false;
     }
-    if (game.state === 'play' && player.invuln <= 0 && overlap(b.x, b.y, r, r, player.x, player.y, hb.hw, hb.hh)) {
-      hitPlayer();
-      return false;
+    for (const p of players) {
+      if (game.state === 'play' && p.alive && p.invuln <= 0 && overlap(b.x, b.y, r, r, p.x, p.y, hb.hw, hb.hh)) {
+        withPlayer(p, hitPlayer);
+        return false;
+      }
     }
     return true;
   });
@@ -1811,9 +1893,10 @@ function updateCoins(dt) {
     c.t += dt;
     c.y += CONFIG.COIN_SPEED * dt;
     c.x += Math.sin(c.t * 3) * 8 * dt;
-    if (player.alive && game.state === 'play') {
-      const dx = player.x - c.x, dy = player.y - c.y, d = Math.hypot(dx, dy);
-      if (d < CONFIG.COIN_PICKUP_RANGE) { collectCoin(c); return false; }
+    const p = target(c.x, c.y);   // 가장 가까운 플레이어가 끌어당기고 먹음 (강화는 먹은 사람에게)
+    if (p.alive && game.state === 'play') {
+      const dx = p.x - c.x, dy = p.y - c.y, d = Math.hypot(dx, dy);
+      if (d < CONFIG.COIN_PICKUP_RANGE) { withPlayer(p, () => collectCoin(c)); return false; }
       if (d < CONFIG.COIN_MAGNET_RANGE) { c.x += (dx / d) * 90 * dt; c.y += (dy / d) * 90 * dt; }
     }
     return c.y < H + 10;
@@ -1830,7 +1913,7 @@ function updateEffects(dt) {
   });
   rings.update((r) => {
     if (r.delay > 0) { r.delay -= dt; return true; }
-    if (r.follow) { r.x = player.x; r.y = player.y; }
+    if (r.follow) { r.x = r.owner.x; r.y = r.owner.y; }
     return (r.life -= dt) > 0;
   });
   texts.update((t) => { t.y -= 14 * dt; return (t.life -= dt) > 0; });
@@ -1854,7 +1937,7 @@ function onWaveStart(w) {
   showBanner('WAVE ' + w, SCENES[si].name);
   Sound.wave();
   // 웨이브 도달 시 수호 구체 자동 강화
-  if (CONFIG.ORB_AUTO_WAVES.includes(w)) levelUpOrb(true);
+  if (CONFIG.ORB_AUTO_WAVES.includes(w)) for (const p of players) if (p.alive) withPlayer(p, () => levelUpOrb(true));
   // N웨이브마다 보스: WAVE 배너 뒤에 경고 → 등장
   if (w % CONFIG.BOSS_EVERY_WAVES === 0) {
     game.nextBoss = BOSS_DEFS[game.bossCount % BOSS_DEFS.length];
@@ -1879,8 +1962,8 @@ function update(dt) {
     if (game.warningT > 0 && game.warningT <= CONFIG.BOSS_WARNING && !game.warnPlayed) { game.warnPlayed = true; Sound.warning(); }
     if (game.warningT <= 0) game.warnPlayed = false;
     updateSpawner(dt);
-    updatePlayer(dt);
-    updateOrbs(dt);
+    for (const p of players) withPlayer(p, () => { updatePlayer(dt); updateOrbs(dt); });
+    gatherOrbs();
   } else if (game.state === 'over') {
     game.overT += dt;
     orbPositions.length = 0;
@@ -2012,7 +2095,7 @@ function drawEvolveFx() {
     ctx.fillStyle = i % 2 ? fx.color : fx.deco;
     for (let d = 10; d < len; d += 3) {
       const w = d < 60 ? 2 : 1;
-      ctx.fillRect(Math.round(player.x + Math.cos(a) * d), Math.round(player.y + Math.sin(a) * d), w, w);
+      ctx.fillRect(Math.round(fx.owner.x + Math.cos(a) * d), Math.round(fx.owner.y + Math.sin(a) * d), w, w);
     }
   }
   ctx.globalAlpha = 1;
@@ -2027,7 +2110,8 @@ function drawEvolveFlash() {
 
 function drawPlayer() {
   if (!player.alive || game.state === 'title') return;
-  drawOrbs(player.x, player.y, orbPositions);
+  drawOrbs(player.x, player.y, player.orbPos);
+  if (game.dual) drawText(player === p1 ? '1P' : '2P', player.x, player.y + 11, skin().breath[1], 1, 'center');
   if (player.invuln > 0 && Math.floor(player.invuln * 14) % 2 === 0) return;   // 무적 깜빡임
   drawDragon(skin(), player.x, player.y, 1, player.tier, player.powerT > 0 && blink(16));
   if (player.muzzle > 0) {                                                      // 입에서 나오는 브레스 섬광
@@ -2148,27 +2232,22 @@ function drawHUD() {
   ctx.fillRect(0, 0, W, 20);
   drawText(String(game.score).padStart(7, '0'), 3, 2, '#ffffff');
   drawText('WAVE ' + game.wave, W / 2, 2, '#9fb3ff', 1, 'center');
-  drawSprite(Sound.muted ? SPR.speakerOff : SPR.speaker, 172, 5);
+  drawSprite(Sound.muted ? SPR.speakerOff : SPR.speaker, W - 8, 5);
 
-  for (let i = 0; i < CONFIG.PLAYER_HP; i++) {
-    ctx.drawImage(i < player.hp ? SPR.heart.img : SPR.heartEmpty.img, 3 + i * 9, 10);
-  }
-  // 스킬 총합 / 상한 (상한 도달 시 깜빡임 → 보스를 잡아야 해제)
-  const tot = totalPower(), cap = powerCap(), locked = tot >= cap && tot < MAX_TOTAL;
-  drawText('P' + tot + '/' + cap, 31, 11, locked ? (blink(2) ? '#ff6a7a' : '#ffb0b8') : '#c8cde0');
-  // 스킬별: 아이콘 + LV (최대면 MAX) + 코인 진행 바
-  const hudSkills = [...SKILL_ORDER, 'orb'];
-  let x = W - 3 - (hudSkills.length * 18 + (hudSkills.length - 1) * 3);
-  for (const k of hudSkills) {
-    const isOrb = k === 'orb';
-    const info = SKILL_INFO[k], lv = isOrb ? player.orb : player.skills[k], max = lv >= (isOrb ? CONFIG.ORB_MAX : CONFIG.SKILL_MAX[k]);
-    drawIcon(info.icon, x, 10, info.color);
-    drawText(max ? 'MAX' : 'LV' + lv, x + 7, 10, max ? (blink(3) ? '#ffffff' : info.color) : '#c8cde0');
-    if (!max) {
-      ctx.fillStyle = '#3a3f5c'; ctx.fillRect(x, 17, 18, 1);
-      ctx.fillStyle = info.color; ctx.fillRect(x, 17, Math.round(18 * player.coinProg[k] / (isOrb ? CONFIG.ORB_COIN_COST : CONFIG.COIN_COST)[lv]), 1);
-    }
-    x += 21;
+  if (!game.dual) drawPlayerStats(10, 0);
+  else {
+    // 듀얼: 1P는 상단 둘째 줄, 2P는 하단 바. 각 줄 가운데에 필살기 게이지
+    withPlayer(p1, () => {
+      drawText('1P', 3, 11, skin().breath[1]);
+      drawPlayerStats(10, 10);
+      drawUltGauge('R', 70, 78, 205 - 78, 12);
+    });
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, H - 11, W, 11);
+    withPlayer(p2, () => {
+      drawText('2P', 3, H - 8, skin().breath[1]);
+      drawPlayerStats(H - 9, 10);
+      drawUltGauge('ENT', 70, 86, 205 - 86, H - 7);
+    });
   }
   // 보스 체력바 + 이름 + 페이즈
   if (game.boss) {
@@ -2181,11 +2260,39 @@ function drawHUD() {
     CONFIG.BOSS_PHASES.forEach((p) => ctx.fillRect(20 + Math.round((W - 40) * p), 23, 1, 3));   // 페이즈 눈금
     drawTextS(b.def.name, W / 2, 29, '#ffb0c0', 1, 'center');
   }
-  // 필살기 게이지 (화면 하단). 발동 가능하면 드래곤 색, 가득이면 깜빡임, 검은 눈금 = 최소 발동선
-  const g = player.ult, col = g < CONFIG.ULT_MIN ? '#8f98bb' : g >= 1 && blink(3) ? '#ffffff' : skin().breath[1];
-  const gx = 11, gw = W - 14, gy = H - 6;
-  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, gy - 3, W, 9);
-  drawText('R', 3, gy - 2, col);
+  // 솔로: 필살기 게이지는 화면 하단
+  if (!game.dual) {
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, H - 9, W, 9);
+    drawUltGauge('R', 3, 11, W - 14, H - 6);
+  }
+}
+// 현재 player의 체력/파워/스킬 한 줄 (y = 줄 위쪽, x0 = 왼쪽 밀림)
+function drawPlayerStats(y, x0) {
+  for (let i = 0; i < CONFIG.PLAYER_HP; i++) {
+    ctx.drawImage(i < player.hp ? SPR.heart.img : SPR.heartEmpty.img, x0 + 3 + i * 9, y);
+  }
+  // 스킬 총합 / 상한 (상한 도달 시 깜빡임 → 보스를 잡아야 해제)
+  const tot = totalPower(), cap = powerCap(), locked = tot >= cap && tot < MAX_TOTAL;
+  drawText('P' + tot + '/' + cap, x0 + 31, y + 1, locked ? (blink(2) ? '#ff6a7a' : '#ffb0b8') : '#c8cde0');
+  // 스킬별: 아이콘 + LV (최대면 MAX) + 코인 진행 바
+  const hudSkills = [...SKILL_ORDER, 'orb'];
+  let x = W - 3 - (hudSkills.length * 18 + (hudSkills.length - 1) * 3);
+  for (const k of hudSkills) {
+    const isOrb = k === 'orb';
+    const info = SKILL_INFO[k], lv = isOrb ? player.orb : player.skills[k], max = lv >= (isOrb ? CONFIG.ORB_MAX : CONFIG.SKILL_MAX[k]);
+    drawIcon(info.icon, x, y, info.color);
+    drawText(max ? 'MAX' : 'LV' + lv, x + 7, y, max ? (blink(3) ? '#ffffff' : info.color) : '#c8cde0');
+    if (!max) {
+      ctx.fillStyle = '#3a3f5c'; ctx.fillRect(x, y + 7, 18, 1);
+      ctx.fillStyle = info.color; ctx.fillRect(x, y + 7, Math.round(18 * player.coinProg[k] / (isOrb ? CONFIG.ORB_COIN_COST : CONFIG.COIN_COST)[lv]), 1);
+    }
+    x += 21;
+  }
+}
+// 현재 player의 필살기 게이지. 발동 가능하면 드래곤 색, 가득이면 깜빡임, 검은 눈금 = 최소 발동선
+function drawUltGauge(label, lx, gx, gw, gy) {
+  const g = player.ult, col = game.dual && !player.alive ? '#3a3f5c' : g < CONFIG.ULT_MIN ? '#8f98bb' : g >= 1 && blink(3) ? '#ffffff' : skin().breath[1];
+  drawText(label, lx, gy - 2, col);
   ctx.fillStyle = '#3a3f5c'; ctx.fillRect(gx, gy, gw, 3);
   ctx.fillStyle = col; ctx.fillRect(gx, gy, Math.round(gw * g), 3);
   ctx.fillStyle = '#000'; ctx.fillRect(gx + Math.round(gw * CONFIG.ULT_MIN), gy, 1, 3);
@@ -2250,10 +2357,12 @@ function drawTitle() {
   });
 
   drawButton(UI.start, 'START', true);
+  if (CAN_DUAL) drawButton(UI.dual, 'DUAL', false);
   drawTextS('BEST ' + String(game.best).padStart(7, '0'), W / 2, 250 + OY, '#ffd23f', 1, 'center');
   drawText('DRAG TO MOVE - AUTO BREATH', W / 2, 270 + OY, '#a0a8c8', 1, 'center');
   drawText('PC: ARROWS/WASD  ENTER: START', W / 2, 280 + OY, '#a0a8c8', 1, 'center');
   drawText('R: NOVA  ESC: PAUSE', W / 2, 290 + OY, '#a0a8c8', 1, 'center');
+  if (CAN_DUAL) drawText('DUAL: KEY 2   2P: ARROWS+ENTER', W / 2, 300 + OY, '#a0a8c8', 1, 'center');
 }
 
 function drawGameOver() {
@@ -2264,7 +2373,7 @@ function drawGameOver() {
   drawText('SCORE', W / 2, 130 + OY, '#8f98bb', 1, 'center');
   drawTextS(String(game.score), W / 2, 139 + OY, '#ffffff', 2, 'center');
   drawText('BEST', W / 2, 162 + OY, '#8f98bb', 1, 'center');
-  drawTextS(String(game.best), W / 2, 171 + OY, '#ffd23f', 1, 'center');
+  drawTextS(String(game.dual ? game.bestDual : game.best), W / 2, 171 + OY, '#ffd23f', 1, 'center');
   if (game.newRecord && blink(3)) drawTextS('NEW RECORD!', W / 2, 186 + OY, '#ffd23f', 1, 'center');
   drawText('WAVE ' + game.wave + '  BOSS ' + game.bossCount, W / 2, 198 + OY, '#9fb3ff', 1, 'center');
   if (game.overT > 0.9) {
@@ -2290,7 +2399,7 @@ function render() {
   for (const e of enemies.active) drawEnemy(e);
   for (const b of bullets.active) drawBreath(b);
   drawEvolveFx();
-  drawPlayer();
+  for (const p of players) withPlayer(p, drawPlayer);
   for (const b of enemyBullets.active) drawEnemyBullet(b);
   drawLasers(false);
   for (const p of particles.active) {
@@ -2321,7 +2430,7 @@ function render() {
     ctx.globalAlpha = 1;
   }
 
-  if (game.state === 'title') { drawTitle(); drawSprite(Sound.muted ? SPR.speakerOff : SPR.speaker, 172, 5); return; }
+  if (game.state === 'title') { drawTitle(); drawSprite(Sound.muted ? SPR.speakerOff : SPR.speaker, W - 8, 5); return; }
 
   drawHUD();
   const by = game.boss ? 40 : 30;
@@ -2336,7 +2445,7 @@ function render() {
     const t = 2.2 - game.evolveT, sc = t < 0.25 ? 4 : 3;
     ctx.globalAlpha = Math.min(1, game.evolveT / 0.4);
     drawTextS('EVOLVE!', W / 2, by + 12, blink(8) ? '#ffffff' : skin().deco, sc, 'center');
-    drawTextS('STAGE ' + player.tier + ' - ' + EVOLVE_NAMES[player.tier], W / 2, by + 12 + sc * 5 + 4, skin().breath[1], 1, 'center');
+    withPlayer(game.evolveWho || p1, () => drawTextS((game.dual ? (player === p1 ? '1P ' : '2P ') : '') + 'STAGE ' + player.tier + ' - ' + EVOLVE_NAMES[player.tier], W / 2, by + 12 + sc * 5 + 4, skin().breath[1], 1, 'center'));
     ctx.globalAlpha = 1;
   }
   if (game.state === 'play') {
@@ -2375,6 +2484,7 @@ function drawPause() {
 // ===== 8. 입력 =====
 const input = { active: false, id: null, tx: W / 2, ty: H - 40 };
 const keys = { left: false, right: false, up: false, down: false };
+const keys2 = { left: false, right: false, up: false, down: false };   // 듀얼 2P (방향키)
 
 function toGame(e) {
   const r = canvas.getBoundingClientRect();
@@ -2385,7 +2495,7 @@ function setTarget(x, y) {
   input.ty = y - CONFIG.TOUCH_OFFSET_Y;   // 손가락보다 위에 드래곤 배치
 }
 const inRect = (x, y, r, pad = 4) => x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad;
-const onMuteBtn = (x, y) => x >= 156 && y <= 20;
+const onMuteBtn = (x, y) => x >= W - 24 && y <= 20;
 
 function selectSkin(i) {
   skinIdx = (i + SKINS.length) % SKINS.length;
@@ -2395,16 +2505,47 @@ function selectSkin(i) {
 }
 // 일시정지: 플레이 중에만. 멈출 때 눌려 있던 키는 풀어서 재개 시 혼자 움직이지 않게
 function setPaused(on) {
-  if (on && (game.state !== 'play' || !player.alive)) return;
+  if (on && (game.state !== 'play' || !players.some((p) => p.alive))) return;
   game.paused = on;
-  for (const k in keys) keys[k] = false;
-  input.active = false;
+  releaseKeys();
   Sound.select();
 }
+function releaseKeys() {
+  for (const k in keys) { keys[k] = false; keys2[k] = false; }
+  input.active = false;
+}
+
+// 화면 가로 폭 변경 (듀얼 ↔ 솔로). 배경 별/장식도 새 폭에 맞게 다시 깔기
+function setWidth(w) {
+  if (W === w) return;
+  W = w;
+  canvas.width = W;
+  ctx.imageSmoothingEnabled = false;   // 캔버스 크기를 바꾸면 초기화되므로 다시 설정
+  layoutUI();
+  for (const l of STAR_LAYERS) for (const s of l.stars) s.x = rand(0, W) | 0;
+  decos.clear();
+  SCENES[game.sceneIdx].spawns.forEach((spec) => spawnDeco(game.sceneIdx, spec.k, rand(40, H - 60)));
+  resize();
+}
+// 솔로/듀얼 전환. 듀얼 2P는 1P와 다른 드래곤(다음 순서)을 씀
+function setMode(dual) {
+  game.dual = dual;
+  players.length = 0;
+  players.push(p1);
+  if (dual) { p2.skinI = (skinIdx + 1) % SKINS.length; players.push(p2); }
+  else p2.alive = false;
+  releaseKeys();
+  setWidth(dual ? CONFIG.DUAL_W : CONFIG.W);
+}
+function startGame(dual) {
+  setMode(dual);
+  resetGame();
+}
 function goTitle() {
+  setMode(false);
   game.state = 'title';
   game.paused = false;
-  game.nova = null;
+  game.novas.length = 0;
   [bullets, enemyBullets, enemies, coins, rings, texts].forEach((p) => p.clear());
   lasers.length = 0;
   game.boss = null;
@@ -2416,7 +2557,8 @@ function titleTap(x, y) {
   if (inRect(x, y, UI.left, 2)) { arrowPress.l = game.clock; selectSkin(skinIdx - 1); return false; }
   if (inRect(x, y, UI.right, 2)) { arrowPress.r = game.clock; selectSkin(skinIdx + 1); return false; }
   for (let i = 0; i < UI.thumbs.length; i++) if (inRect(x, y, UI.thumbs[i], 1)) { if (i !== skinIdx) selectSkin(i); return false; }
-  if (inRect(x, y, UI.start)) { resetGame(); return true; }
+  if (inRect(x, y, UI.start)) { startGame(false); return true; }
+  if (CAN_DUAL && inRect(x, y, UI.dual)) { startGame(true); return true; }
   return false;
 }
 
@@ -2474,16 +2616,26 @@ window.addEventListener('keydown', (e) => {
     if (KEYMAP[e.code] === 'right') { arrowPress.r = game.clock; selectSkin(skinIdx + 1); }
     return;
   }
-  if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = true; input.active = false; e.preventDefault(); }
+  if (KEYMAP[e.code]) { keysFor(e.code)[KEYMAP[e.code]] = true; input.active = false; e.preventDefault(); }
   if (e.code === 'KeyM') Sound.toggle();
-  if (e.code === 'KeyR' && !e.repeat) fireUlt();
+  if (e.code === 'KeyR' && !e.repeat) withPlayer(p1, fireUlt);
+  // 듀얼 2P 필살기: Enter / 숫자패드 0
+  if (game.dual && game.state === 'play' && !e.repeat && (e.code === 'Enter' || e.code === 'NumpadEnter' || e.code === 'Numpad0')) {
+    e.preventDefault();
+    withPlayer(p2, fireUlt);
+    return;
+  }
+  if (CAN_DUAL && game.state === 'title' && (e.code === 'Digit2' || e.code === 'Numpad2')) { startGame(true); return; }
   if (e.code === 'Enter' || e.code === 'Space') {
     e.preventDefault();
-    if (game.state === 'title' || (game.state === 'over' && game.overT > 0.9)) resetGame();
+    if (game.state === 'title') startGame(false);
+    else if (game.state === 'over' && game.overT > 0.9) resetGame();
   }
 });
-window.addEventListener('keyup', (e) => { if (KEYMAP[e.code]) keys[KEYMAP[e.code]] = false; });
-window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; input.active = false; });
+// 듀얼에선 방향키가 2P, 솔로에선 WASD/방향키 모두 같은 드래곤
+const keysFor = (code) => (game.dual && code.startsWith('Arrow') ? keys2 : keys);
+window.addEventListener('keyup', (e) => { if (KEYMAP[e.code]) keysFor(e.code)[KEYMAP[e.code]] = false; });
+window.addEventListener('blur', releaseKeys);
 
 function resize() {
   const s = Math.min(window.innerWidth / W, window.innerHeight / H);
@@ -2515,7 +2667,7 @@ requestAnimationFrame(loop);
 
 // 테스트/디버그용 핸들
 window.__game = {
-  game, player, enemies, bullets, enemyBullets, coins, decos, lasers, CONFIG, SKINS, SCENES, BOSS_DEFS, H, perf,
+  game, player, p2, players, startGame, enemies, bullets, enemyBullets, coins, decos, lasers, CONFIG, SKINS, SCENES, BOSS_DEFS, H, perf,
   resetGame, spawnBoss, hitPlayer, spawnCoin, spawnEnemy, setScene, selectSkin, levelUp, totalPower, powerCap,
   skin: () => skinIdx, killEnemy, levelUpOrb, orbPositions, checkEvolve,
 };
