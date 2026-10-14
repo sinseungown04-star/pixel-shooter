@@ -957,6 +957,8 @@ const UI = {
   start: { x: W / 2 - 46, y: 216 + OY, w: 92, h: 24 },
   retry: { x: W / 2 - 62, y: 216 + OY, w: 58, h: 22 },
   menu: { x: W / 2 + 4, y: 216 + OY, w: 58, h: 22 },
+  resume: { x: W / 2 - 46, y: 150 + OY, w: 92, h: 24 },
+  quit: { x: W / 2 - 46, y: 182 + OY, w: 92, h: 22 },
 };
 const preview = { beams: [], fireT: 0 };   // 드래곤 선택 미리보기 브레스
 const arrowPress = { l: -1, r: -1 };
@@ -975,7 +977,7 @@ const sceneForWave = (w) => { let s = 0; CONFIG.SCENE_WAVES.forEach((sw, i) => {
 
 function resetGame() {
   Object.assign(game, {
-    state: 'play', time: 0, wave: 1, score: 0, spawnT: 1, bossCount: 0, warningT: 0, boss: null, nextBoss: null, warnPlayed: false,
+    state: 'play', paused: false, time: 0, wave: 1, score: 0, spawnT: 1, bossCount: 0, warningT: 0, boss: null, nextBoss: null, warnPlayed: false,
     shake: 0, overT: 0, newRecord: false, purgeBullets: false, skillT: 0, evolveT: 0, lastCoin: -99, lightning: null,
   });
   Object.assign(player, { x: W / 2, y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0.2, alive: true, muzzle: 0, powerT: 0, tier: 0 });
@@ -2181,6 +2183,7 @@ function drawTitle() {
   drawTextS('BEST ' + String(game.best).padStart(7, '0'), W / 2, 250 + OY, '#ffd23f', 1, 'center');
   drawText('DRAG TO MOVE - AUTO BREATH', W / 2, 270 + OY, '#a0a8c8', 1, 'center');
   drawText('PC: ARROWS/WASD  ENTER: START', W / 2, 280 + OY, '#a0a8c8', 1, 'center');
+  drawText('ESC: PAUSE', W / 2, 290 + OY, '#a0a8c8', 1, 'center');
 }
 
 function drawGameOver() {
@@ -2288,6 +2291,15 @@ function render() {
     }
   }
   if (game.state === 'over') drawGameOver();
+  if (game.paused) drawPause();
+}
+
+function drawPause() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+  drawTextS('PAUSED', W / 2, 110 + OY, '#ffffff', 2, 'center');
+  drawButton(UI.resume, 'RESUME', true);
+  drawButton(UI.quit, 'DRAGONS', false);
+  drawText('ESC: RESUME', W / 2, 214 + OY, '#a0a8c8', 1, 'center');
 }
 
 // ===== 8. 입력 =====
@@ -2311,8 +2323,17 @@ function selectSkin(i) {
   preview.beams.length = 0;
   Sound.select();
 }
+// 일시정지: 플레이 중에만. 멈출 때 눌려 있던 키는 풀어서 재개 시 혼자 움직이지 않게
+function setPaused(on) {
+  if (on && (game.state !== 'play' || !player.alive)) return;
+  game.paused = on;
+  for (const k in keys) keys[k] = false;
+  input.active = false;
+  Sound.select();
+}
 function goTitle() {
   game.state = 'title';
+  game.paused = false;
   [bullets, enemyBullets, enemies, coins, rings, texts].forEach((p) => p.clear());
   lasers.length = 0;
   game.boss = null;
@@ -2333,6 +2354,11 @@ canvas.addEventListener('pointerdown', (e) => {
   Sound.init();
   const { x, y } = toGame(e);
   if (onMuteBtn(x, y)) { Sound.toggle(); return; }
+  if (game.paused) {
+    if (inRect(x, y, UI.resume)) setPaused(false);
+    else if (inRect(x, y, UI.quit)) goTitle();
+    return;
+  }
   if (game.state === 'title') {
     if (!titleTap(x, y)) return;
   } else if (game.state === 'over') {
@@ -2364,6 +2390,12 @@ const KEYMAP = {
 };
 window.addEventListener('keydown', (e) => {
   Sound.init();
+  if (e.code === 'Escape' && !e.repeat) { e.preventDefault(); setPaused(!game.paused); return; }
+  if (game.paused) {
+    if (e.code === 'KeyM') Sound.toggle();
+    if (e.code === 'Enter' || e.code === 'Space') { e.preventDefault(); setPaused(false); }
+    return;
+  }
   if (game.state === 'title' && KEYMAP[e.code]) {
     e.preventDefault();
     if (e.repeat) return;
@@ -2401,7 +2433,7 @@ function loop(ts) {
   const dt = lastTs ? Math.min(0.05, (ts - lastTs) / 1000) : 1 / 60;
   lastTs = ts;
   const t0 = performance.now();
-  update(dt);
+  if (!game.paused) update(dt);
   render();
   const w = performance.now() - t0;
   perf.frames++; perf.work += w; perf.maxWork = Math.max(perf.maxWork, w);
