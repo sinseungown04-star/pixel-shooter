@@ -119,6 +119,13 @@ const CONFIG = {
   HURT_HITSTOP: 0.1,               // 피격 순간 잠깐 멈칫 (초)
   SKILL_BANNER_TIME: 1.3,
 
+  // 필살기 (R): 적을 잡을 때마다 게이지 충전 → 모인 만큼 크고 강한 충격파
+  ULT_GAIN: { imp: 0.025, bat: 0.025, charger: 0.035, mage: 0.035, elite: 0.12, boss: 0.3 },
+  ULT_MIN: 0.25,                   // 이만큼은 모여야 발동
+  ULT_DAMAGE: 40,                  // 게이지 가득일 때 피해 (게이지 비율만큼 줄어듦)
+  ULT_RADIUS_MIN: 40,              // 가득이면 화면 전체
+  ULT_TIME: 0.5,                   // 충격파가 퍼지는 시간 (초)
+
   // 점수
   SCORE: { imp: 100, bat: 150, charger: 200, mage: 250, elite: 1200, boss: 5000, coin: 50, cappedCoin: 300 },
 };
@@ -886,6 +893,12 @@ const Sound = {
   select() { if (this.ok('select', 0.04)) this.tone('square', 880, 1320, 0.06, 0.07); },
   wave() { if (this.ok('wave', 0.3)) { this.tone('triangle', 523, null, 0.1, 0.15); this.tone('triangle', 784, null, 0.18, 0.15, 0.1); } },
   start() { if (this.ok('start', 0.3)) [523, 659, 784, 1047].forEach((f, i) => this.tone('square', f, null, 0.08, 0.07, i * 0.07)); },
+  ult(g) {
+    if (!this.ok('ult', 0.3)) return;
+    this.tone('sawtooth', 110, 880, 0.3, 0.12);
+    this.noise(0.6 + 0.6 * g, 0.5, 2400, 0.05);
+    this.tone('square', 220, 40, 0.8, 0.1, 0.1);
+  },
 };
 
 // ===== 5. 오브젝트 풀 (생성/GC 비용을 줄이기 위해 객체 재사용) =====
@@ -929,6 +942,7 @@ const game = {
   shake: 0, shakeMag: 0, banner: '', sub: '', bannerT: 0, overT: 0, newRecord: false, clock: 0,
   skillText: '', skillColor: '#fff', skillT: 0, evolveT: 0, lastCoin: -99,
   purgeBullets: false,
+  nova: null, novaSeq: 0, novaKill: false,   // 필살기 충격파
   // 배경 단계 보간 상태
   timeScale: 1, slowmo: 0, evolveFx: null,   // 진화 슬로모션 / 연출
   sceneIdx: 0, sceneT: 1, sceneFrom: null, decoTimers: [], flash: null, lightning: null, lightningT: 0,
@@ -942,6 +956,7 @@ const player = {
   skills: { rate: 0, spread: 0, damage: 0, pierce: 0 },
   coinProg: { rate: 0, spread: 0, damage: 0, pierce: 0, orb: 0 },   // 다음 강화까지 모은 코인
   orb: 0, orbAngle: 0,            // 수호 구체 레벨 / 회전 각도
+  ult: 0,                         // 필살기 게이지 (0~1)
 };
 
 // 별(먼지) 패럴랙스 3겹. 색은 배경 단계에서 보간
@@ -978,9 +993,9 @@ const sceneForWave = (w) => { let s = 0; CONFIG.SCENE_WAVES.forEach((sw, i) => {
 function resetGame() {
   Object.assign(game, {
     state: 'play', paused: false, time: 0, wave: 1, score: 0, spawnT: 1, bossCount: 0, warningT: 0, boss: null, nextBoss: null, warnPlayed: false,
-    shake: 0, overT: 0, newRecord: false, purgeBullets: false, skillT: 0, evolveT: 0, lastCoin: -99, lightning: null,
+    shake: 0, overT: 0, newRecord: false, purgeBullets: false, skillT: 0, evolveT: 0, lastCoin: -99, lightning: null, nova: null,
   });
-  Object.assign(player, { x: W / 2, y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0.2, alive: true, muzzle: 0, powerT: 0, tier: 0 });
+  Object.assign(player, { x: W / 2, y: H - 40, hp: CONFIG.PLAYER_HP, invuln: 0, fireT: 0.2, alive: true, muzzle: 0, powerT: 0, tier: 0, ult: 0 });
   player.skills = { rate: 0, spread: 0, damage: 0, pierce: 0 };
   player.coinProg = { rate: 0, spread: 0, damage: 0, pierce: 0, orb: 0 };
   player.orb = 0; player.orbAngle = 0;
@@ -1474,6 +1489,12 @@ function killEnemy(e, drop) {
   if (e.dead) return;
   e.dead = true;
   game.score += e.score;
+  // 필살기 게이지 충전 (필살기로 잡은 적은 제외)
+  if (!game.novaKill && player.alive) {
+    const before = player.ult;
+    player.ult = Math.min(1, before + (CONFIG.ULT_GAIN[e.type] || 0));
+    if (before < CONFIG.ULT_MIN && player.ult >= CONFIG.ULT_MIN) popText(player.x, player.y - 20, 'R: NOVA READY', skin().breath[1]);
+  }
   if (e.boss) {
     onBossDefeated(e);
     return;
@@ -1507,6 +1528,46 @@ function onBossDefeated(e) {
   // 보상: 상한 해제 + 확정 스킬 강화 1회 (진화 구간을 넘으면 EVOLVE 연출)
   const options = SKILL_ORDER.filter((k) => player.skills[k] < CONFIG.SKILL_MAX[k]);
   if (options.length && totalPower() < powerCap() && player.alive) levelUp(pick(options), true);
+}
+
+// --- 필살기: 드래곤 노바 ---
+// 게이지 비율만큼 반경/피해가 커지는 충격파. 퍼지면서 닿는 적에게 한 번씩 피해 + 적 탄 소멸
+function fireUlt() {
+  if (game.state !== 'play' || !player.alive) return;
+  const g = player.ult;
+  if (g < CONFIG.ULT_MIN) { Sound.locked(); return; }
+  player.ult = 0;
+  const sk = skin(), maxR = lerp(CONFIG.ULT_RADIUS_MIN, Math.hypot(W, H), g);
+  game.nova = { x: player.x, y: player.y, t: 0, maxR, dmg: CONFIG.ULT_DAMAGE * g, id: ++game.novaSeq };
+  ring(player.x, player.y, '#ffffff', maxR, CONFIG.ULT_TIME);
+  ring(player.x, player.y, sk.breath[1], maxR * 0.85, CONFIG.ULT_TIME, false, 0.05);
+  ring(player.x, player.y, sk.deco, maxR * 0.7, CONFIG.ULT_TIME, false, 0.1);
+  explode(player.x, player.y, [sk.breath[1], sk.deco, '#ffffff'], Math.round(30 + 50 * g), 60 + 80 * g, 3);
+  shake(0.3 + 0.4 * g, 1 + 3 * g);
+  game.flash = { color: sk.breath[1], t: 0.4 + 0.6 * g };
+  showSkill(g >= 1 ? 'MAX NOVA!' : 'NOVA!', sk.breath[1]);
+  Sound.ult(g);
+}
+function updateNova(dt) {
+  const n = game.nova;
+  if (!n) return;
+  n.t += dt;
+  const r = n.maxR * Math.min(1, n.t / CONFIG.ULT_TIME);
+  game.novaKill = true;
+  for (const e of enemies.active) {
+    if (e.dead || e.novaId === n.id) continue;
+    const reach = r + Math.max(e.w, e.h) / 2;
+    if ((e.x - n.x) ** 2 + (e.y - n.y) ** 2 > reach * reach) continue;
+    e.novaId = n.id;
+    damageEnemy(e, n.dmg, e.x, e.y);
+  }
+  game.novaKill = false;
+  enemyBullets.update((b) => {
+    if ((b.x - n.x) ** 2 + (b.y - n.y) ** 2 > r * r) return true;
+    explode(b.x, b.y, ['#ffffff'], 1, 15, 1);
+    return false;
+  });
+  if (n.t >= CONFIG.ULT_TIME) game.nova = null;
 }
 
 // --- 보스 패턴 ---
@@ -1825,6 +1886,7 @@ function update(dt) {
     orbPositions.length = 0;
   }
   if (game.state !== 'title') {
+    updateNova(dt);
     updateEnemies(dt);
     updateLasers(dt);
     updateBullets(dt);
@@ -2119,6 +2181,14 @@ function drawHUD() {
     CONFIG.BOSS_PHASES.forEach((p) => ctx.fillRect(20 + Math.round((W - 40) * p), 23, 1, 3));   // 페이즈 눈금
     drawTextS(b.def.name, W / 2, 29, '#ffb0c0', 1, 'center');
   }
+  // 필살기 게이지 (화면 하단). 발동 가능하면 드래곤 색, 가득이면 깜빡임, 검은 눈금 = 최소 발동선
+  const g = player.ult, col = g < CONFIG.ULT_MIN ? '#8f98bb' : g >= 1 && blink(3) ? '#ffffff' : skin().breath[1];
+  const gx = 11, gw = W - 14, gy = H - 6;
+  ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, gy - 3, W, 9);
+  drawText('R', 3, gy - 2, col);
+  ctx.fillStyle = '#3a3f5c'; ctx.fillRect(gx, gy, gw, 3);
+  ctx.fillStyle = col; ctx.fillRect(gx, gy, Math.round(gw * g), 3);
+  ctx.fillStyle = '#000'; ctx.fillRect(gx + Math.round(gw * CONFIG.ULT_MIN), gy, 1, 3);
 }
 
 function drawButton(r, label, primary = true) {
@@ -2183,7 +2253,7 @@ function drawTitle() {
   drawTextS('BEST ' + String(game.best).padStart(7, '0'), W / 2, 250 + OY, '#ffd23f', 1, 'center');
   drawText('DRAG TO MOVE - AUTO BREATH', W / 2, 270 + OY, '#a0a8c8', 1, 'center');
   drawText('PC: ARROWS/WASD  ENTER: START', W / 2, 280 + OY, '#a0a8c8', 1, 'center');
-  drawText('ESC: PAUSE', W / 2, 290 + OY, '#a0a8c8', 1, 'center');
+  drawText('R: NOVA  ESC: PAUSE', W / 2, 290 + OY, '#a0a8c8', 1, 'center');
 }
 
 function drawGameOver() {
@@ -2334,6 +2404,7 @@ function setPaused(on) {
 function goTitle() {
   game.state = 'title';
   game.paused = false;
+  game.nova = null;
   [bullets, enemyBullets, enemies, coins, rings, texts].forEach((p) => p.clear());
   lasers.length = 0;
   game.boss = null;
@@ -2405,6 +2476,7 @@ window.addEventListener('keydown', (e) => {
   }
   if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = true; input.active = false; e.preventDefault(); }
   if (e.code === 'KeyM') Sound.toggle();
+  if (e.code === 'KeyR' && !e.repeat) fireUlt();
   if (e.code === 'Enter' || e.code === 'Space') {
     e.preventDefault();
     if (game.state === 'title' || (game.state === 'over' && game.overT > 0.9)) resetGame();
